@@ -7,14 +7,15 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // --- 1. CONEXIÓN A MONGODB ---
-mongoose.connect(process.env.MONGO_URI)
-    .then(() => console.log("✅ Conectado a MongoDB Atlas"))
-    .catch(err => console.error("❌ Error de MongoDB:", err));
-
-const ClientSchema = new mongoose.Schema({
-    robloxId: { type: String, required: true, unique: true },
-    addedBy: String,
-    date: { type: Date, default: Date.now }
+mongoose.connect(process.env.MONGO_URI, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+    serverSelectionTimeoutMS: 5000 // Falla rápido si no conecta
+})
+.then(() => console.log("✅ Conectado a MongoDB Atlas con éxito"))
+.catch(err => {
+    console.error("❌ ERROR CRÍTICO DE CONEXIÓN:");
+    console.error(err.message);
 });
 const Whitelist = mongoose.model('Whitelist', ClientSchema);
 
