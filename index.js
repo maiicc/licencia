@@ -55,15 +55,25 @@ client.on('messageCreate', async (msg) => {
     // Solo tú puedes usar estos comandos
     if (msg.author.id !== ADMIN_ID) return;
 
-    if (command === "whitelist") {
+if (command === "whitelist") {
         const id = args[0];
         if (!id) return msg.reply("❌ Uso: !whitelist [ID_de_Roblox]");
 
         try {
-            await Whitelist.create({ robloxId: id, addedBy: msg.author.tag });
-            msg.reply(`✅ ID **${id}** ha sido añadido a la lista blanca.`);
+            // Intentamos crear el registro
+            const newEntry = await Whitelist.create({ 
+                robloxId: id.toString(), 
+                addedBy: msg.author.tag 
+            });
+            msg.reply(`✅ ID **${id}** añadido con éxito.`);
         } catch (err) {
-            msg.reply("❌ Ese ID ya está en la lista o hubo un error.");
+            console.error(err); // Esto aparecerá en la consola de Railway
+            
+            if (err.code === 11000) {
+                msg.reply("❌ Error: Ese ID ya está en la lista blanca.");
+            } else {
+                msg.reply(`❌ Error de base de datos: ${err.message}`);
+            }
         }
     }
 
