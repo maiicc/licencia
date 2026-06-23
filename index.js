@@ -90,15 +90,22 @@ client.on('messageCreate', async (msg) => {
         }
     }
 
-    if (command === "unwhitelist") {
+if (command === "unwhitelist") {
         const id = args[0];
         if (!id) return msg.reply("❌ Uso: !unwhitelist [ID]");
 
         try {
-            await pool.query('DELETE FROM whitelist WHERE roblox_id = $1', [id]);
-            msg.reply(`🗑️ ID **${id}** eliminado.`);
+            const result = await pool.query('DELETE FROM whitelist WHERE roblox_id = $1', [id]);
+            
+            // rowCount nos dice cuántas filas fueron afectadas por el DELETE
+            if (result.rowCount > 0) {
+                msg.reply(`🗑️ ID **${id}** eliminado de la lista blanca con éxito.`);
+            } else {
+                msg.reply(`⚠️ El ID **${id}** no estaba en la lista blanca, por lo que no se borró nada.`);
+            }
         } catch (err) {
-            msg.reply(`❌ Error: ${err.message}`);
+            console.error(err);
+            msg.reply(`❌ Error al intentar eliminar: ${err.message}`);
         }
     }
 });
