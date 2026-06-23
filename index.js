@@ -6,18 +6,20 @@ require('dotenv').config(); // Esto permite usar variables de entorno
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// --- 1. CONEXIÓN A MONGODB ---
-mongoose.connect(process.env.MONGO_URI, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true,
-    serverSelectionTimeoutMS: 5000 // Falla rápido si no conecta
-})
-.then(() => console.log("✅ Conectado a MongoDB Atlas con éxito"))
-.catch(err => {
-    console.error("❌ ERROR CRÍTICO DE CONEXIÓN:");
-    console.error(err.message);
+// 1. DEFINIR EL SCHEMA PRIMERO
+const ClientSchema = new mongoose.Schema({
+    robloxId: { type: String, required: true, unique: true },
+    addedBy: String,
+    date: { type: Date, default: Date.now }
 });
+
+// 2. DEFINIR EL MODELO DESPUÉS (usando el Schema anterior)
 const Whitelist = mongoose.model('Whitelist', ClientSchema);
+
+// 3. CONEXIÓN A MONGODB
+mongoose.connect(process.env.MONGO_URI)
+    .then(() => console.log("✅ Conectado a MongoDB Atlas"))
+    .catch(err => console.error("❌ Error de MongoDB:", err));
 
 app.use(express.json());
 
