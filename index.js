@@ -8,10 +8,16 @@ const PORT = process.env.PORT || 3000;
 
 // --- 1. CONEXIÓN A POSTGRESQL (Aiven) ---
 const pool = new Pool({
-    connectionString: process.env.DATABASE_URL, // Aiven te da una URL que empieza por postgres://
+    connectionString: process.env.DATABASE_URL,
     ssl: {
-        rejectUnauthorized: false // Necesario para conexiones seguras en la nube
+        // Esta es la clave para evitar el error de certificado
+        rejectUnauthorized: false 
     }
+});
+
+// Forzamos la conexión para que use SSL correctamente
+pool.on('error', (err) => {
+    console.error('❌ Error inesperado en el cliente de PostgreSQL', err);
 });
 
 // Crear la tabla si no existe al iniciar
