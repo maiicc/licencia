@@ -16,9 +16,10 @@ const PRODUCTS = ["overhead", "level", "music", "all"];
 const KEY_RE = /^VX-[A-F0-9]{6}(-[A-F0-9]{6}){3}$/;
 const EPHEMERAL = MessageFlags.Ephemeral;
 
+// Neon / Supabase exigen SSL
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: DATABASE_URL && DATABASE_URL.includes("render.com") ? { rejectUnauthorized: false } : false,
+  ssl: { rejectUnauthorized: false },
 });
 
 const sha = (s) => crypto.createHash("sha256").update(s).digest("hex");
