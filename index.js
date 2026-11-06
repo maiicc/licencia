@@ -8,7 +8,7 @@ const {
 } = require("discord.js");
 
 const {
-  DATABASE_URL, DISCORD_TOKEN, CLIENT_ID, GUILD_ID, ADMIN_ROLE_ID, LOG_CHANNEL_ID,
+  DATABASE_URL, DISCORD_TOKEN, CLIENT_ID, GUILD_ID, OWNER_ID, LOG_CHANNEL_ID,
   PORT = 3000,
 } = process.env;
 
@@ -18,7 +18,6 @@ const EPHEMERAL = MessageFlags.Ephemeral;
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  // La URL externa de Render exige SSL; la interna no.
   ssl: DATABASE_URL && DATABASE_URL.includes("render.com") ? { rejectUnauthorized: false } : false,
 });
 
@@ -36,7 +35,7 @@ async function initDb() {
       key_hash   TEXT UNIQUE NOT NULL,
       prefix     TEXT UNIQUE NOT NULL,
       product    TEXT NOT NULL,
-      discord_id TEXT NOT NULL,
+      buyer      TEXT NOT NULL,
       max_games  INT NOT NULL DEFAULT 1,
       revoked    BOOLEAN NOT NULL DEFAULT FALSE,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -56,7 +55,8 @@ async function initDb() {
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 const logged = new Map();
 
-// Logs al canal; con "once" se evita repetir el mismo aviso durante 10 minutos
+// Avisos: al canal si hay LOG_CHANNEL_ID, si no por DM a ti.
+// Con "once" se evita repetir el mismo aviso durante 10 minutos.
 async function log(text, once) {
   try {
     if (once) {
@@ -64,8 +64,13 @@ async function log(text, once) {
       if (last && Date.now() - last < 600_000) return;
       logged.set(once, Date.now());
     }
-    const channel = await client.channels.fetch(LOG_CHANNEL_ID);
-    await channel.send(text);
+    if (LOG_CHANNEL_ID) {
+      const channel = await client.channels.fetch(LOG_CHANNEL_ID);
+      await channel.send(text);
+    } else {
+      const owner = await client.users.fetch(OWNER_ID);
+      await owner.send(text);
+    }
   } catch (e) {
     console.error("log error:", e.message);
   }
@@ -75,7 +80,6 @@ async function log(text, once) {
 const app = express();
 app.set("trust proxy", 1);
 app.use(express.json({ limit: "2kb" }));
-// Los servidores de Roblox comparten IPs entre muchos juegos: límite generoso.
 app.use(rateLimit({ windowMs: 60_000, limit: 300, standardHeaders: true, legacyHeaders: false }));
 
 app.get("/health", (_req, res) => res.send("ok"));
@@ -90,6 +94,7 @@ app.post("/verify", async (req, res) => {
   }
   if (!KEY_RE.test(key)) return res.json({ ok: false, reason: "invalid" });
 
+  const place = Number.isInteger(placeId) ? placeId : null;
   const db = await pool.connect();
   try {
     await db.query("BEGIN");
@@ -102,14 +107,14 @@ app.post("/verify", async (req, res) => {
 
     if (!lic) return deny("invalid");
     if (lic.revoked) {
-      log(`🚫 Licencia \`${lic.prefix}\` revocada intentó usarse en el juego \`${gameId}\`.`, `rev:${lic.id}:${gameId}`);
+      log(`🚫 Licencia \`${lic.prefix}\` (${lic.buyer}) revocada intentó usarse en el juego \`${gameId}\`.`, `rev:${lic.id}:${gameId}`);
       return deny("revoked");
     }
     if (lic.product !== "all" && lic.product !== product) return deny("product");
 
     const act = await db.query(
       "UPDATE activations SET last_seen = NOW(), place_id = $3 WHERE license_id = $1 AND game_id = $2",
-      [lic.id, gameId, Number.isInteger(placeId) ? placeId : null]
+      [lic.id, gameId, place]
     );
 
     if (act.rowCount === 0) {
@@ -117,14 +122,14 @@ app.post("/verify", async (req, res) => {
         "SELECT COUNT(*)::int AS count FROM activations WHERE license_id = $1", [lic.id]
       );
       if (count >= lic.max_games) {
-        log(`⚠️ Licencia \`${lic.prefix}\` (<@${lic.discord_id}>) superó su límite (${lic.max_games}). Intento desde el juego \`${gameId}\`.`, `lim:${lic.id}:${gameId}`);
+        log(`⚠️ Licencia \`${lic.prefix}\` (${lic.buyer}) superó su límite (${lic.max_games}). Intento desde el juego \`${gameId}\`.`, `lim:${lic.id}:${gameId}`);
         return deny("limit");
       }
       await db.query(
         "INSERT INTO activations (license_id, game_id, place_id) VALUES ($1, $2, $3)",
-        [lic.id, gameId, Number.isInteger(placeId) ? placeId : null]
+        [lic.id, gameId, place]
       );
-      log(`🔗 Licencia \`${lic.prefix}\` (<@${lic.discord_id}>, ${product}) enlazada al juego \`${gameId}\` (${count + 1}/${lic.max_games}).`);
+      log(`🔗 Licencia \`${lic.prefix}\` (${lic.buyer}, ${product}) enlazada al juego \`${gameId}\` (${count + 1}/${lic.max_games}).`);
     }
 
     await db.query("COMMIT");
@@ -139,40 +144,38 @@ app.post("/verify", async (req, res) => {
 });
 
 // ---------- Comandos ----------
+const keyOption = (o) => o.setName("key").setDescription("Key completa o prefijo (6 caracteres)").setRequired(true);
+
 const commands = [
   new SlashCommandBuilder()
     .setName("license")
     .setDescription("Gestión de licencias")
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addSubcommand((s) => s.setName("create").setDescription("Crea una licencia y se la envía por DM")
-      .addUserOption((o) => o.setName("usuario").setDescription("Comprador").setRequired(true))
+    .addSubcommand((s) => s.setName("create").setDescription("Crea una licencia (solo tú ves la key)")
       .addStringOption((o) => o.setName("producto").setDescription("Producto").setRequired(true)
         .addChoices(...PRODUCTS.map((p) => ({ name: p, value: p }))))
+      .addStringOption((o) => o.setName("comprador").setDescription("Nombre o nota para identificarlo").setRequired(true).setMaxLength(60))
       .addIntegerOption((o) => o.setName("juegos").setDescription("Máximo de juegos (por defecto 1)").setMinValue(1).setMaxValue(10)))
-    .addSubcommand((s) => s.setName("revoke").setDescription("Revoca una licencia")
-      .addStringOption((o) => o.setName("key").setDescription("Key completa o prefijo").setRequired(true)))
-    .addSubcommand((s) => s.setName("restore").setDescription("Reactiva una licencia revocada")
-      .addStringOption((o) => o.setName("key").setDescription("Key completa o prefijo").setRequired(true)))
-    .addSubcommand((s) => s.setName("reset").setDescription("Libera los juegos enlazados")
-      .addStringOption((o) => o.setName("key").setDescription("Key completa o prefijo").setRequired(true)))
-    .addSubcommand((s) => s.setName("info").setDescription("Muestra dónde se usa una licencia")
-      .addStringOption((o) => o.setName("key").setDescription("Key completa o prefijo").setRequired(true)))
-    .addSubcommand((s) => s.setName("list").setDescription("Lista las licencias de un usuario")
-      .addUserOption((o) => o.setName("usuario").setDescription("Comprador").setRequired(true))),
+    .addSubcommand((s) => s.setName("revoke").setDescription("Revoca una licencia").addStringOption(keyOption))
+    .addSubcommand((s) => s.setName("restore").setDescription("Reactiva una licencia revocada").addStringOption(keyOption))
+    .addSubcommand((s) => s.setName("reset").setDescription("Libera los juegos enlazados").addStringOption(keyOption))
+    .addSubcommand((s) => s.setName("info").setDescription("Muestra dónde se usa una licencia").addStringOption(keyOption))
+    .addSubcommand((s) => s.setName("list").setDescription("Lista tus licencias (las últimas 25)")
+      .addStringOption((o) => o.setName("buscar").setDescription("Filtrar por nombre del comprador"))),
 ].map((c) => c.toJSON());
 
 async function findLicense(input) {
   const v = input.trim().toUpperCase();
   const q = v.length > 6
     ? await pool.query("SELECT * FROM licenses WHERE key_hash = $1", [sha(v)])
-    : await pool.query("SELECT * FROM licenses WHERE prefix = $1", [v]);
+    : await pool.query("SELECT * FROM licenses WHERE prefix = $1", [v.replace(/^VX-/, "")]);
   return q.rows[0];
 }
 
 client.on("interactionCreate", async (i) => {
   if (!i.isChatInputCommand() || i.commandName !== "license") return;
 
-  if (!i.member?.roles?.cache?.has(ADMIN_ROLE_ID)) {
+  if (i.user.id !== OWNER_ID) {
     return i.reply({ content: "No tienes permiso.", flags: EPHEMERAL });
   }
   await i.deferReply({ flags: EPHEMERAL });
@@ -181,8 +184,8 @@ client.on("interactionCreate", async (i) => {
     const sub = i.options.getSubcommand();
 
     if (sub === "create") {
-      const user = i.options.getUser("usuario");
       const product = i.options.getString("producto");
+      const buyer = i.options.getString("comprador");
       const max = i.options.getInteger("juegos") ?? 1;
 
       let key, prefix, saved = false;
@@ -191,8 +194,8 @@ client.on("interactionCreate", async (i) => {
         prefix = key.slice(3, 9);
         try {
           await pool.query(
-            "INSERT INTO licenses (key_hash, prefix, product, discord_id, max_games) VALUES ($1,$2,$3,$4,$5)",
-            [sha(key), prefix, product, user.id, max]
+            "INSERT INTO licenses (key_hash, prefix, product, buyer, max_games) VALUES ($1,$2,$3,$4,$5)",
+            [sha(key), prefix, product, buyer, max]
           );
           saved = true;
         } catch (e) {
@@ -201,28 +204,25 @@ client.on("interactionCreate", async (i) => {
       }
       if (!saved) return i.editReply("No se pudo generar una key única. Intenta de nuevo.");
 
-      let dm = true;
-      try {
-        await user.send(`🔑 Tu licencia de **${product}**:\n\`${key}\`\nPégala en \`ServerScriptService/Licensing/LicenseKeys\`. Es válida para ${max} juego(s). No la compartas.`);
-      } catch {
-        dm = false;
-      }
-      log(`✅ ${i.user} creó la licencia \`${prefix}\` (${product}, ${max} juego/s) para ${user}.`);
       return i.editReply(
-        dm
-          ? `Licencia \`${prefix}\` creada y enviada por DM a ${user}.`
-          : `Licencia creada, pero ${user} tiene los DM cerrados. Entrégasela tú (solo se muestra una vez):\n\`${key}\``
+        `✅ Licencia creada para **${buyer}** (${product}, ${max} juego/s).\n` +
+        `Cópiala ahora, **solo se muestra una vez**:\n\`${key}\`\n` +
+        `Después la gestionas con el prefijo \`${prefix}\`.`
       );
     }
 
     if (sub === "list") {
-      const user = i.options.getUser("usuario");
-      const { rows } = await pool.query(
-        "SELECT prefix, product, max_games, revoked FROM licenses WHERE discord_id = $1 ORDER BY id DESC LIMIT 20",
-        [user.id]
+      const search = i.options.getString("buscar");
+      const { rows } = search
+        ? await pool.query(
+            "SELECT prefix, product, buyer, max_games, revoked FROM licenses WHERE buyer ILIKE $1 ORDER BY id DESC LIMIT 25",
+            [`%${search}%`])
+        : await pool.query(
+            "SELECT prefix, product, buyer, max_games, revoked FROM licenses ORDER BY id DESC LIMIT 25");
+      if (!rows.length) return i.editReply("No hay licencias.");
+      return i.editReply(
+        rows.map((r) => `\`${r.prefix}\` · ${r.buyer} · ${r.product} · ${r.max_games} juego/s${r.revoked ? " · 🚫 revocada" : ""}`).join("\n")
       );
-      if (!rows.length) return i.editReply("Ese usuario no tiene licencias.");
-      return i.editReply(rows.map((r) => `\`${r.prefix}\` · ${r.product} · ${r.max_games} juego/s${r.revoked ? " · 🚫 revocada" : ""}`).join("\n"));
     }
 
     const lic = await findLicense(i.options.getString("key"));
@@ -231,14 +231,12 @@ client.on("interactionCreate", async (i) => {
     if (sub === "revoke" || sub === "restore") {
       const revoke = sub === "revoke";
       await pool.query("UPDATE licenses SET revoked = $2 WHERE id = $1", [lic.id, revoke]);
-      log(`${revoke ? "🚫" : "♻️"} ${i.user} ${revoke ? "revocó" : "reactivó"} la licencia \`${lic.prefix}\`.`);
-      return i.editReply(`Licencia \`${lic.prefix}\` ${revoke ? "revocada" : "reactivada"}. La revocación aplica cuando un servidor del juego se reinicia.`);
+      return i.editReply(`Licencia \`${lic.prefix}\` (${lic.buyer}) ${revoke ? "revocada" : "reactivada"}. La revocación aplica cuando un servidor del juego se reinicia.`);
     }
 
     if (sub === "reset") {
       await pool.query("DELETE FROM activations WHERE license_id = $1", [lic.id]);
-      log(`🔄 ${i.user} liberó los juegos de la licencia \`${lic.prefix}\`.`);
-      return i.editReply(`Juegos de \`${lic.prefix}\` liberados.`);
+      return i.editReply(`Juegos de \`${lic.prefix}\` (${lic.buyer}) liberados.`);
     }
 
     if (sub === "info") {
@@ -250,7 +248,7 @@ client.on("interactionCreate", async (i) => {
         ? rows.map((r) => `• Juego \`${r.game_id}\` (place \`${r.place_id ?? "?"}\`) · visto <t:${Math.floor(new Date(r.last_seen) / 1000)}:R>`).join("\n")
         : "Sin usos todavía.";
       return i.editReply(
-        `**\`${lic.prefix}\`** · ${lic.product} · dueño <@${lic.discord_id}>\n` +
+        `**\`${lic.prefix}\`** · ${lic.product} · ${lic.buyer}\n` +
         `Límite: ${lic.max_games} juego/s · Estado: ${lic.revoked ? "🚫 revocada" : "✅ activa"}\n${games}`
       );
     }
@@ -262,6 +260,7 @@ client.on("interactionCreate", async (i) => {
 
 // ---------- Arranque ----------
 (async () => {
+  if (!OWNER_ID) throw new Error("Falta la variable OWNER_ID");
   await initDb();
   app.listen(PORT, () => console.log(`API escuchando en :${PORT}`));
 
