@@ -4,7 +4,7 @@ const rateLimit = require("express-rate-limit");
 const { Pool } = require("pg");
 const {
   Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder,
-  PermissionFlagsBits, MessageFlags,
+  PermissionFlagsBits, MessageFlags, EmbedBuilder,
 } = require("discord.js");
 
 const {
@@ -50,15 +50,22 @@ async function initDb() {
       PRIMARY KEY (license_id, game_id)
     );
   `);
+  await pool.query(`
+    ALTER TABLE activations
+      ADD COLUMN IF NOT EXISTS game_name  TEXT,
+      ADD COLUMN IF NOT EXISTS owner_name TEXT,
+      ADD COLUMN IF NOT EXISTS owner_id   BIGINT,
+      ADD COLUMN IF NOT EXISTS owner_type TEXT;
+  `);
 }
 
 // ---------- Discord ----------
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 const logged = new Map();
 
-// Avisos: al canal si hay LOG_CHANNEL_ID, si no por DM a ti.
+// Avisos (texto o embed): al canal si hay LOG_CHANNEL_ID, si no por DM a ti.
 // Con "once" se evita repetir el mismo aviso durante 10 minutos.
-async function log(text, once) {
+async function log(content, once) {
   try {
     if (once) {
       const last = logged.get(once);
@@ -67,26 +74,69 @@ async function log(text, once) {
     }
     if (LOG_CHANNEL_ID) {
       const channel = await client.channels.fetch(LOG_CHANNEL_ID);
-      await channel.send(text);
+      await channel.send(content);
     } else {
       const owner = await client.users.fetch(OWNER_ID);
-      await owner.send(text);
+      await owner.send(content);
     }
   } catch (e) {
     console.error("log error:", e.message);
   }
 }
 
+// ---------- Helpers de logs ----------
+// Los datos vienen del juego del comprador: se limpian antes de mostrarlos
+const clean = (v, max = 80) =>
+  String(v ?? "?").replace(/[`*_~|>\\@\[\]()]/g, "").replace(/\s+/g, " ").trim().slice(0, max) || "?";
+
+function parseInfo(body) {
+  const num = (n) => (Number.isInteger(n) && n >= 0 ? n : null);
+  return {
+    gameName: clean(body.gameName),
+    ownerName: clean(body.ownerName, 40),
+    ownerId: num(body.ownerId),
+    ownerType: body.ownerType === "Group" ? "Grupo" : body.ownerType === "User" ? "Usuario" : "?",
+    players: num(body.players) ?? 0,
+  };
+}
+
+function ownerUrl(info) {
+  if (!info.ownerId) return null;
+  return info.ownerType === "Grupo"
+    ? `https://www.roblox.com/communities/${info.ownerId}`
+    : `https://www.roblox.com/users/${info.ownerId}/profile`;
+}
+
+function logEmbed(title, color, lic, product, info, gameId, place, extra) {
+  const link = place ? `https://www.roblox.com/games/${place}` : null;
+  const oUrl = ownerUrl(info);
+  const embed = new EmbedBuilder()
+    .setTitle(title)
+    .setColor(color)
+    .addFields(
+      { name: "Licencia", value: `\`${lic.prefix}\` · ${clean(lic.buyer, 60)}`, inline: true },
+      { name: "Producto", value: product, inline: true },
+      { name: "Juego", value: link ? `[${info.gameName}](${link})` : info.gameName },
+      { name: "Dueño", value: oUrl ? `[${info.ownerName}](${oUrl}) (${info.ownerType})` : `${info.ownerName} (${info.ownerType})`, inline: true },
+      { name: "GameId / PlaceId", value: `\`${gameId}\` / \`${place ?? "?"}\``, inline: true },
+      { name: "Jugadores ahora", value: String(info.players), inline: true },
+    )
+    .setTimestamp();
+  if (extra) embed.setDescription(extra);
+  return { embeds: [embed] };
+}
+
 // ---------- API ----------
 const app = express();
 app.set("trust proxy", 1);
-app.use(express.json({ limit: "2kb" }));
+app.use(express.json({ limit: "4kb" }));
 app.use(rateLimit({ windowMs: 60_000, limit: 300, standardHeaders: true, legacyHeaders: false }));
 
 app.get("/health", (_req, res) => res.send("ok"));
 
 app.post("/verify", async (req, res) => {
-  const { product, key, gameId, placeId } = req.body || {};
+  const body = req.body || {};
+  const { product, key, gameId, placeId } = body;
   if (
     typeof product !== "string" || typeof key !== "string" ||
     !Number.isInteger(gameId) || gameId <= 0
@@ -95,7 +145,8 @@ app.post("/verify", async (req, res) => {
   }
   if (!KEY_RE.test(key)) return res.json({ ok: false, reason: "invalid" });
 
-  const place = Number.isInteger(placeId) ? placeId : null;
+  const place = Number.isInteger(placeId) && placeId > 0 ? placeId : null;
+  const info = parseInfo(body);
   const db = await pool.connect();
   try {
     await db.query("BEGIN");
@@ -108,14 +159,17 @@ app.post("/verify", async (req, res) => {
 
     if (!lic) return deny("invalid");
     if (lic.revoked) {
-      log(`🚫 Licencia \`${lic.prefix}\` (${lic.buyer}) revocada intentó usarse en el juego \`${gameId}\`.`, `rev:${lic.id}:${gameId}`);
+      log(logEmbed("🚫 Licencia revocada en uso", 0xed4245, lic, product, info, gameId, place), `rev:${lic.id}:${gameId}`);
       return deny("revoked");
     }
     if (lic.product !== "all" && lic.product !== product) return deny("product");
 
     const act = await db.query(
-      "UPDATE activations SET last_seen = NOW(), place_id = $3 WHERE license_id = $1 AND game_id = $2",
-      [lic.id, gameId, place]
+      `UPDATE activations
+          SET last_seen = NOW(), place_id = $3, game_name = $4,
+              owner_name = $5, owner_id = $6, owner_type = $7
+        WHERE license_id = $1 AND game_id = $2`,
+      [lic.id, gameId, place, info.gameName, info.ownerName, info.ownerId, info.ownerType]
     );
 
     if (act.rowCount === 0) {
@@ -123,14 +177,20 @@ app.post("/verify", async (req, res) => {
         "SELECT COUNT(*)::int AS count FROM activations WHERE license_id = $1", [lic.id]
       );
       if (count >= lic.max_games) {
-        log(`⚠️ Licencia \`${lic.prefix}\` (${lic.buyer}) superó su límite (${lic.max_games}). Intento desde el juego \`${gameId}\`.`, `lim:${lic.id}:${gameId}`);
+        log(
+          logEmbed("⚠️ Límite de juegos superado", 0xfee75c, lic, product, info, gameId, place,
+            `Intento bloqueado. Límite: ${lic.max_games} juego/s.`),
+          `lim:${lic.id}:${gameId}`
+        );
         return deny("limit");
       }
       await db.query(
-        "INSERT INTO activations (license_id, game_id, place_id) VALUES ($1, $2, $3)",
-        [lic.id, gameId, place]
+        `INSERT INTO activations (license_id, game_id, place_id, game_name, owner_name, owner_id, owner_type)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [lic.id, gameId, place, info.gameName, info.ownerName, info.ownerId, info.ownerType]
       );
-      log(`🔗 Licencia \`${lic.prefix}\` (${lic.buyer}, ${product}) enlazada al juego \`${gameId}\` (${count + 1}/${lic.max_games}).`);
+      log(logEmbed("🔗 Nueva activación", 0x57f287, lic, product, info, gameId, place,
+        `Juegos usados: ${count + 1}/${lic.max_games}`));
     }
 
     await db.query("COMMIT");
@@ -242,11 +302,15 @@ client.on("interactionCreate", async (i) => {
 
     if (sub === "info") {
       const { rows } = await pool.query(
-        "SELECT game_id, place_id, last_seen FROM activations WHERE license_id = $1 ORDER BY last_seen DESC LIMIT 10",
+        "SELECT game_id, place_id, game_name, owner_name, owner_type, last_seen FROM activations WHERE license_id = $1 ORDER BY last_seen DESC LIMIT 10",
         [lic.id]
       );
       const games = rows.length
-        ? rows.map((r) => `• Juego \`${r.game_id}\` (place \`${r.place_id ?? "?"}\`) · visto <t:${Math.floor(new Date(r.last_seen) / 1000)}:R>`).join("\n")
+        ? rows.map((r) => {
+            const name = r.game_name || "?";
+            const title = r.place_id ? `[${name}](https://www.roblox.com/games/${r.place_id})` : name;
+            return `• ${title} · dueño: ${r.owner_name ?? "?"} (${r.owner_type ?? "?"}) · visto <t:${Math.floor(new Date(r.last_seen) / 1000)}:R>`;
+          }).join("\n")
         : "Sin usos todavía.";
       return i.editReply(
         `**\`${lic.prefix}\`** · ${lic.product} · ${lic.buyer}\n` +
